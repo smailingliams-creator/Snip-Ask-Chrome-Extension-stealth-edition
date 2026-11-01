@@ -1,0 +1,238 @@
+// src/background/guest-config.js
+// Guest Mode: Allows users without API keys to use the extension
+// Backend (Cloudflare Worker) is the sole authority for rate limiting
+
+import { getDeviceFingerprint } from './fingerprint.js';
+import {
+    REQUEST_TOO_LARGE_MESSAGE,
+    extractErrorMessage,
+    isContextLimitErrorMessage
+} from './ai/errors.js';
+import { OPENAI_COMPATIBLE_PROVIDERS, getProviderStorageKeys } from './models/provider-registry.js';
+
+// --- CONFIGURATION ---
+
+const GUEST_WORKER_URL = 'https://snip-ask-guest.saurav04042004.workers.dev/';
+// Keep this aligned with a stable, widely-available Groq model.
+// Guest mode uses this only as a fallback when the user's selection isn't a Groq model.
+// Prefer a fast default for no-friction first use.
+const GUEST_DEFAULT_MODEL = 'groq:auto';
+const DEFAULT_PROVIDER_VISIBILITY = {
+    groq: true,
+    google: false,
+    openai: false,
+    openrouter: false,
+    ollama: false,
+    // Registry providers are all opt-in.
+    ...Object.fromEntries(Object.keys(OPENAI_COMPATIBLE_PROVIDERS).map(id => [id, false]))
+};
+const GUEST_SAFE_PAYLOAD_LIMIT_BYTES = 700 * 1024;
+const GUEST_REQUEST_TIMEOUT_MS = 60000;
+
+// --- INSTANCE ID MANAGEMENT ---
+
+/**
+ * Get or create a unique instance ID for this extension installation.
+ */
+async function getInstanceId() {
+    const storage = await chrome.storage.local.get(['guestInstanceId']);
+
+    if (storage.guestInstanceId) {
+        return storage.guestInstanceId;
+    }
+
+    const instanceId = 'snip-' + crypto.randomUUID();
+    await chrome.storage.local.set({ guestInstanceId: instanceId });
+    return instanceId;
+}
+
+// --- GUEST MODE DETECTION ---
+
+/**
+ * Check if the extension is in Guest Mode (no user API keys configured)
+ * Returns true only if ALL API key fields are empty or contain only whitespace
+ */
+async function isGuestMode() {
+    const storage = await chrome.storage.local.get([
+        'enabledProviders',
+        'groqKey',
+        'geminiKey',
+        'openaiKey',
+        'openrouterKey',
+        'ollamaHost',
+        ...getProviderStorageKeys()
+    ]);
+
+    const enabledProviders = {
+        ...DEFAULT_PROVIDER_VISIBILITY,
+        ...(storage.enabledProviders || {})
+    };
+
+    // Only count fields that are visible in the API key section.
+    const hasGroqKey = enabledProviders.groq && storage.groqKey && storage.groqKey.trim().length > 0;
+    const hasGeminiKey = enabledProviders.google && storage.geminiKey && storage.geminiKey.trim().length > 0;
+    const hasOpenAIKey = enabledProviders.openai && storage.openaiKey && storage.openaiKey.trim().length > 0;
+    const hasOpenRouterKey = enabledProviders.openrouter && storage.openrouterKey && storage.openrouterKey.trim().length > 0;
+    const hasOllamaHost = enabledProviders.ollama && storage.ollamaHost && storage.ollamaHost.trim().length > 0;
+
+    const hasRegistryKey = Object.values(OPENAI_COMPATIBLE_PROVIDERS).some(config => {
+        const key = storage[config.storageKey];
+        return enabledProviders[config.id] && typeof key === 'string' && key.trim().length > 0;
+    });
+
+    // Guest mode = NO keys entered at all
+    return !hasGroqKey && !hasGeminiKey && !hasOpenAIKey && !hasOpenRouterKey && !hasOllamaHost && !hasRegistryKey;
+}
+
+/**
+ * Check if Guest Mode is properly configured (worker URL is set)
+ */
+function isGuestConfigured() {
+    return GUEST_WORKER_URL && !GUEST_WORKER_URL.includes('YOUR_SUBDOMAIN');
+}
+
+// --- GUEST API REQUEST ---
+
+/**
+ * Make a Guest Mode API request through the Cloudflare Worker proxy
+ * @param {Object} requestBody - The request body to send to Groq API
+ * @returns {Promise<Object>} - The API response
+ */
+async function makeGuestRequest(requestBody, externalSignal = null) {
+    if (!isGuestConfigured()) {
+        throw new Error('Guest Mode is not configured. Please add your own API key.');
+    }
+
+    // Get identifiers for anti-abuse tracking
+    const clientUuid = await getInstanceId();
+    const deviceFingerprint = await getDeviceFingerprint();
+
+    // Inject identifiers into _meta
+    const enrichedBody = {
+        ...requestBody,
+        _meta: {
+            ...requestBody._meta,
+            clientUuid,
+            deviceFingerprint
+        }
+    };
+
+    const payloadJson = JSON.stringify(enrichedBody);
+    const payloadBytes = new TextEncoder().encode(payloadJson).length;
+    if (payloadBytes > GUEST_SAFE_PAYLOAD_LIMIT_BYTES) {
+        throw new Error(`Guest request too large (${Math.round(payloadBytes / 1024)} KB). Try a smaller snip or shorter chat context.`);
+    }
+
+    // Use chrome.runtime.id as origin validation token
+    // This is dynamic - no hardcoding needed
+    // After publishing, this will be your consistent extension ID
+    const extensionId = chrome.runtime.id;
+
+    // Allow a bit more time for guest vision requests to complete.
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), GUEST_REQUEST_TIMEOUT_MS);
+
+    // Track whether cancellation was user-initiated vs timeout
+    let cancelledByUser = false;
+
+    // Link external abort signal to our internal controller
+    let externalAbortHandler;
+    if (externalSignal) {
+        if (externalSignal.aborted) {
+            clearTimeout(timeoutId);
+            throw new Error('Request cancelled.');
+        }
+        externalAbortHandler = () => {
+            cancelledByUser = true;
+            controller.abort();
+        };
+        externalSignal.addEventListener('abort', externalAbortHandler);
+    }
+
+    let response;
+    try {
+        response = await fetch(GUEST_WORKER_URL, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Extension-Id': extensionId  // Dynamic origin validation
+            },
+            body: payloadJson,
+            signal: controller.signal
+        });
+    } catch (error) {
+        clearTimeout(timeoutId);
+        if (error.name === 'AbortError') {
+            throw new Error(cancelledByUser ? 'Request cancelled.' : 'Request timed out. Please try again.');
+        }
+        throw error;
+    } finally {
+        if (externalSignal && externalAbortHandler) {
+            externalSignal.removeEventListener('abort', externalAbortHandler);
+        }
+    }
+    clearTimeout(timeoutId);
+
+    let data;
+    try {
+        data = await response.json();
+    } catch {
+        throw new Error(response.ok
+            ? 'Guest Mode returned an invalid response. Please try again.'
+            : 'Guest Mode service error. Please try again later.');
+    }
+
+    if (!response.ok && response.status !== 429 && isContextLimitErrorMessage(data.error || data.message || data)) {
+        throw new Error(REQUEST_TOO_LARGE_MESSAGE);
+    }
+
+    // Handle errors from anti-abuse system
+    if (data.code === 'BANNED') {
+        throw new Error(data.message || 'Access denied. Please contact support.');
+    }
+
+    if (data.code === 'RATE_LIMITED') {
+        throw new Error(data.message || 'Too many requests. Please wait a minute and try again.');
+    }
+
+    if (data.code === 'HARD_CAP') {
+        throw new Error(data.message || 'Daily limit reached. Get your own free API key at console.groq.com!');
+    }
+
+    if (data.code === 'NETWORK_DAILY_LIMIT') {
+        throw new Error(data.message || 'Guest capacity for this network is exhausted. Please try again tomorrow or add your own API key.');
+    }
+
+    if (data.code === 'API_EXHAUSTED') {
+        throw new Error(data.message || 'Service temporarily unavailable. Please try again in a few minutes.');
+    }
+
+    if (data.code === 'UNSUPPORTED_MODEL') {
+        throw new Error('This model needs your own API key — Guest Mode only covers the built-in Groq models. Add the provider key in Settings, or switch back to a Guest Mode model.');
+    }
+
+    if (data.code === 'MISSING_ID') {
+        throw new Error('Please update your extension to the latest version.');
+    }
+
+    if (data.code === 'INVALID_EXTENSION_ID' || data.code === 'INVALID_ORIGIN') {
+        throw new Error('Unauthorized extension. This build is not allowed to use Guest Mode.');
+    }
+
+    if (!response.ok) {
+        throw new Error(extractErrorMessage(data.error, 'Guest Mode service error. Please try again later.'));
+    }
+
+    return data;
+}
+
+// --- EXPORTS ---
+
+export {
+    GUEST_WORKER_URL,
+    GUEST_DEFAULT_MODEL,
+    getInstanceId,
+    isGuestMode,
+    isGuestConfigured,
+    makeGuestRequest
+};
